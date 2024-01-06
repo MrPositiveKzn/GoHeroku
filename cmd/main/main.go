@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
-	"flag"
-	"fmt"
+	"bytes"
 	"html/template"
 	"log"
 	"math"
@@ -12,51 +10,22 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/freshman-tech/news-demo/news"
+	"github.com/joho/godotenv"
 )
 
-var tpl = template.Must(template.ParseFiles("./assets/index.html"))
-var apiKey *string
-
-type Source struct {
-	ID   interface{} `json:"id"`
-	Name string      `json:"name"`
-}
-
-type Article struct {
-	Source      Source    `json:"source"`
-	Author      string    `json:"author"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	URL         string    `json:"url"`
-	URLToImage  string    `json:"urlToImage"`
-	PublishedAt time.Time `json:"publishedAt"`
-	Content     string    `json:"content"`
-}
-
-func (a *Article) FormatPublishedDate() string {
-	year, month, day := a.PublishedAt.Date()
-	return fmt.Sprintf("%v %d, %d", month, day, year)
-}
-
-type Results struct {
-	Status       string    `json:"status"`
-	TotalResults int       `json:"totalResults"`
-	Articles     []Article `json:"articles"`
-}
+var tpl = template.Must(template.ParseFiles("index.html"))
 
 type Search struct {
-	SearchKey  string
+	Query      string
 	NextPage   int
 	TotalPages int
-	Results    Results
+	Results    *news.Results
 }
 
 func (s *Search) IsLastPage() bool {
 	return s.NextPage >= s.TotalPages
-}
-
-func (s *Search) PreviousPage() int {
-	return s.CurrentPage() - 1
 }
 
 func (s *Search) CurrentPage() int {
@@ -67,87 +36,94 @@ func (s *Search) CurrentPage() int {
 	return s.NextPage - 1
 }
 
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	tpl.Execute(w, nil)
+func (s *Search) PreviousPage() int {
+	return s.CurrentPage() - 1
 }
 
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	u, err := url.Parse(r.URL.String())
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	buf := &bytes.Buffer{}
+	err := tpl.Execute(buf, nil)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Internal server error"))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	params := u.Query()
-	searchKey := params.Get("q")
-	page := params.Get("page")
-	if page == "" {
-		page = "1"
-	}
+	buf.WriteTo(w)
+}
 
-	search := &Search{}
-	search.SearchKey = searchKey
+func searchHandler(newsapi *news.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, err := url.Parse(r.URL.String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	next, err := strconv.Atoi(page)
-	if err != nil {
-		http.Error(w, "Unexpected server error", http.StatusInternalServerError)
-		return
-	}
+		params := u.Query()
+		searchQuery := params.Get("q")
+		page := params.Get("page")
+		if page == "" {
+			page = "1"
+		}
 
-	search.NextPage = next
-	pageSize := 20
+		results, err := newsapi.FetchEverything(searchQuery, page)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	endpoint := fmt.Sprintf("https://newsapi.org/v2/everything?q=%s&pageSize=%d&page=%d&apiKey=%s&sortBy=publishedAt&language=en", url.QueryEscape(search.SearchKey), pageSize, search.NextPage, *apiKey)
-	resp, err := http.Get(endpoint)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+		nextPage, err := strconv.Atoi(page)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	defer resp.Body.Close()
+		search := &Search{
+			Query:      searchQuery,
+			NextPage:   nextPage,
+			TotalPages: int(math.Ceil(float64(results.TotalResults) / float64(newsapi.PageSize))),
+			Results:    results,
+		}
 
-	if resp.StatusCode != 200 {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+		if ok := !search.IsLastPage(); ok {
+			search.NextPage++
+		}
 
-	err = json.NewDecoder(resp.Body).Decode(&search.Results)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+		buf := &bytes.Buffer{}
+		err = tpl.Execute(buf, search)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	search.TotalPages = int(math.Ceil(float64(search.Results.TotalResults / pageSize)))
-	if ok := !search.IsLastPage(); ok {
-		search.NextPage++
-	}
-
-	err = tpl.Execute(w, search)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		buf.WriteTo(w)
 	}
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Error loading .env file")
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
 
-	apiKey = flag.String("apikey", "", "Access key")
-	flag.Parse()
-
-	if *apiKey == "" {
-		log.Fatal("apiKey must be set")
+	apiKey := os.Getenv("NEWS_API_KEY")
+	if apiKey == "" {
+		log.Fatal("Env: apiKey must be set")
 	}
 
+	myClient := &http.Client{Timeout: 10 * time.Second}
+	newsapi := news.NewClient(myClient, apiKey, 20)
+
+	fs := http.FileServer(http.Dir("assets"))
+
 	mux := http.NewServeMux()
-
-	fs := http.FileServer(http.Dir("./assets"))
 	mux.Handle("/assets/", http.StripPrefix("/assets/", fs))
-
-	mux.HandleFunc("/search", searchHandler)
+	mux.HandleFunc("/search", searchHandler(newsapi))
 	mux.HandleFunc("/", indexHandler)
 	http.ListenAndServe(":"+port, mux)
 }
